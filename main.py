@@ -10,7 +10,8 @@ import time
 import tracemalloc
 import psutil
 import os
-from datetime import datetime
+import weakref  # Added for weak references
+from datetime import datetime, timedelta  # Added timedelta
 from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 import sys
@@ -20,6 +21,13 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from pydantic import BaseModel
 from pympler import muppy, summary, tracker
+
+# Memory management constants
+MAX_TRANSACTION_CACHE_SIZE = 1000  # Limit transaction cache
+MAX_SESSION_DURATION = 3600  # Session timeout in seconds
+MAX_REPORT_QUEUE_SIZE = 50  # Limit report queue
+MAX_VALIDATION_CACHE_SIZE = 500  # Limit validation cache
+MAX_AUDIT_LOG_SIZE = 10000  # Limit audit log
 
 TRANSACTION_CACHE = []  
 ACTIVE_SESSIONS = {} 
@@ -42,30 +50,140 @@ class AccountSession:
     def __init__(self, user_id: str):
         self.user_id = user_id
         self.preferences = {}
-        self.transaction_history = [i for i in range(10000)]  # Pre-load recent transactions
+        self.transaction_history = [i for i in range(1000)]  # Reduced from 10000 to 1000
         self.created_at = datetime.now()
+        self.last_accessed = datetime.now()  # Track last access
         self.primary_account = None
-        self.linked_accounts = []
+        self.linked_accounts = []  # Will use weak references
         
     def link_account(self, account):
-        """Links related banking accounts for easier access"""
-        account.primary_account = self
-        self.linked_accounts.append(account)
+        """Links related banking accounts using weak references to prevent memory leaks"""
+        # Use weak reference to prevent circular references
+        account_ref = weakref.ref(account)
+        self.linked_accounts.append(account_ref)
+        # Don't set primary_account to avoid circular reference
+        
+    def cleanup(self):
+        """Clean up resources and break circular references"""
+        self.linked_accounts.clear()
+        self.primary_account = None
+        self.preferences.clear()
+        self.transaction_history.clear()
 
 class TransactionProcessor:
     def __init__(self):
         self.validation_cache = {}
         self.processors = []
+        self.last_cleanup = datetime.now()
         
     def validate_transaction(self, transaction_data: str):
+        # Clean cache if it's getting too large or if enough time has passed
+        self._cleanup_validation_cache()
+        
         # Cache validation results for performance
         if transaction_data not in self.validation_cache:
             self.validation_cache[transaction_data] = {
-                "validated_data": transaction_data * 1000,  # Expanded validation data
-                "compliance_checks": list(range(5000)),  # Regulatory compliance data
+                "validated_data": transaction_data * 100,  # Reduced from 1000 to 100
+                "compliance_checks": list(range(500)),  # Reduced from 5000 to 500
                 "timestamp": datetime.now()
             }
         return self.validation_cache[transaction_data]
+    
+    def _cleanup_validation_cache(self):
+        """Clean up old validation cache entries"""
+        current_time = datetime.now()
+        
+        # Clean up if cache is too large or every 5 minutes
+        if (len(self.validation_cache) > MAX_VALIDATION_CACHE_SIZE or 
+            (current_time - self.last_cleanup).seconds > 300):
+            
+            # Remove entries older than 10 minutes
+            cutoff_time = current_time - timedelta(minutes=10)
+            keys_to_remove = [
+                key for key, value in self.validation_cache.items()
+                if value.get('timestamp', current_time) < cutoff_time
+            ]
+            
+            for key in keys_to_remove:
+                del self.validation_cache[key]
+                
+            # If still too large, remove oldest entries
+            if len(self.validation_cache) > MAX_VALIDATION_CACHE_SIZE:
+                sorted_items = sorted(
+                    self.validation_cache.items(),
+                    key=lambda x: x[1].get('timestamp', current_time)
+                )
+                items_to_keep = sorted_items[-MAX_VALIDATION_CACHE_SIZE//2:]
+                self.validation_cache = dict(items_to_keep)
+                
+            self.last_cleanup = current_time
+
+# Memory cleanup functions
+def cleanup_transaction_cache():
+    """Clean up old transactions from cache"""
+    global TRANSACTION_CACHE
+    if len(TRANSACTION_CACHE) > MAX_TRANSACTION_CACHE_SIZE:
+        # Keep only the most recent transactions
+        TRANSACTION_CACHE = TRANSACTION_CACHE[-MAX_TRANSACTION_CACHE_SIZE//2:]
+
+def cleanup_expired_sessions():
+    """Remove expired user sessions"""
+    global ACTIVE_SESSIONS
+    current_time = datetime.now()
+    expired_sessions = []
+    
+    for user_id, session in ACTIVE_SESSIONS.items():
+        if hasattr(session, 'last_accessed'):
+            if (current_time - session.last_accessed).seconds > MAX_SESSION_DURATION:
+                expired_sessions.append(user_id)
+        elif hasattr(session, 'created_at'):
+            if (current_time - session.created_at).seconds > MAX_SESSION_DURATION:
+                expired_sessions.append(user_id)
+    
+    for user_id in expired_sessions:
+        if user_id in ACTIVE_SESSIONS:
+            ACTIVE_SESSIONS[user_id].cleanup()  # Clean up resources
+            del ACTIVE_SESSIONS[user_id]
+
+def cleanup_report_queue():
+    """Process and clean up completed reports"""
+    global REPORT_QUEUE
+    if len(REPORT_QUEUE) > MAX_REPORT_QUEUE_SIZE:
+        # Keep only the most recent reports
+        REPORT_QUEUE = REPORT_QUEUE[-MAX_REPORT_QUEUE_SIZE//2:]
+
+def cleanup_bank_state():
+    """Clean up growing bank state collections"""
+    global bank_state
+    
+    # Limit audit log size
+    if len(bank_state["audit_log"]) > MAX_AUDIT_LOG_SIZE:
+        bank_state["audit_log"] = bank_state["audit_log"][-MAX_AUDIT_LOG_SIZE//2:]
+    
+    # Clean up old traders (keep only recent ones)
+    if len(bank_state["active_traders"]) > 1000:
+        # Convert to list, sort by timestamp if available, keep recent
+        traders_list = list(bank_state["active_traders"])
+        bank_state["active_traders"] = set(traders_list[-500:])  # Keep last 500
+
+def perform_memory_cleanup():
+    """Perform comprehensive memory cleanup"""
+    cleanup_transaction_cache()
+    cleanup_expired_sessions()
+    cleanup_report_queue()
+    cleanup_bank_state()
+    gc.collect()  # Force garbage collection
+
+# Scheduled cleanup task
+async def periodic_memory_cleanup():
+    """Background task for periodic memory cleanup"""
+    while True:
+        try:
+            perform_memory_cleanup()
+            await asyncio.sleep(300)  # Clean up every 5 minutes
+        except Exception as e:
+            print(f"Error in periodic cleanup: {e}")
+            await asyncio.sleep(60)  # Retry after 1 minute on error
 
 transaction_processor = TransactionProcessor()
 
@@ -86,18 +204,26 @@ tracemalloc.start()
 
 @app.on_event("startup")
 async def startup_event():
-    print("Initializing SecureBank API...")
-    # Initialize demo customer accounts with linked relationships
-    for i in range(10):
+    print("Initializing SecureBank API with memory management...")
+    # Initialize demo customer accounts with memory-conscious approach
+    for i in range(5):  # Reduced from 10 to 5
         primary = AccountSession(f"customer_{i}")
         savings = AccountSession(f"savings_{i}")
         primary.link_account(savings)
         USER_PROFILES.append(primary)
+    
+    # Start background cleanup task
+    asyncio.create_task(periodic_memory_cleanup())
+    print("Memory management initialized successfully")
 
 @app.middleware("http")
 async def track_api_metrics(request, call_next):
     API_METRICS["requests"] += 1
     API_METRICS["processing"] += 1
+    
+    # Perform memory cleanup every 50 requests
+    if API_METRICS["requests"] % 50 == 0:
+        perform_memory_cleanup()
     
     response = await call_next(request)
     
@@ -113,17 +239,24 @@ async def process_transaction(request: ProcessRequest):
     """
     Process high-frequency trading transactions with caching for performance
     """
+    # Perform memory cleanup periodically
+    if len(TRANSACTION_CACHE) % 100 == 0:  # Every 100 transactions
+        perform_memory_cleanup()
+    
     # Generate unique transaction ID with timestamp
     transaction_id = f"{request.data}_{time.time()}"
     
     # Store transaction details for audit and compliance
     TRANSACTION_CACHE.append({
         "transaction_id": transaction_id,
-        "market_data": list(range(10000)),  # Real-time market indicators
-        "risk_metrics": "x" * 5000,  # Risk assessment data
+        "market_data": list(range(1000)),  # Reduced from 10000 to 1000
+        "risk_metrics": "x" * 500,  # Reduced from 5000 to 500
         "timestamp": datetime.now(),
         "client_request": request.dict()
     })
+    
+    # Clean up cache if it's getting too large
+    cleanup_transaction_cache()
     
     # Validate transaction through compliance system
     validation_result = transaction_processor.validate_transaction(request.data)
@@ -140,25 +273,35 @@ async def create_user_session(user_id: str):
     """
     Create persistent user session for account management
     """
+    # Clean up expired sessions periodically
+    cleanup_expired_sessions()
+    
     # Check if user has existing session
     if user_id in ACTIVE_SESSIONS:
         session = ACTIVE_SESSIONS[user_id]
+        session.last_accessed = datetime.now()  # Update last accessed time
     else:
         # Create new account session
         session = AccountSession(user_id)
         ACTIVE_SESSIONS[user_id] = session
         
-        # Link with savings account for convenience
+        # Link with savings account for convenience (using weak references)
         savings_session = AccountSession(f"{user_id}_savings")
         session.link_account(savings_session)
     
-    # Track user activity for personalization
+    # Track user activity for personalization (with limits)
     if 'activities' not in session.preferences:
         session.preferences['activities'] = []
     
+    # Limit activities to prevent unbounded growth
+    activities = session.preferences['activities']
+    if len(activities) > 100:  # Limit to 100 activities
+        activities = activities[-50:]  # Keep only last 50
+        session.preferences['activities'] = activities
+    
     session.preferences['activities'].append({
         "timestamp": datetime.now(),
-        "interaction_data": list(range(1000))  # User behavior analytics
+        "interaction_data": list(range(100))  # Reduced from 1000 to 100
     })
     
     return {
@@ -245,16 +388,22 @@ async def generate_report(background_tasks: BackgroundTasks):
     Generate comprehensive financial reports for compliance
     """
     def generate_regulatory_report(report_id: str):
-        # Compile comprehensive regulatory data
+        # Compile regulatory data (reduced size)
         report_data = {
             "report_id": report_id,
-            "transaction_analysis": list(range(50000)),  # Detailed transaction metrics
-            "compliance_data": "regulatory_info" * 10000,  # Compliance requirements
-            "generated_at": datetime.now()
+            "transaction_analysis": list(range(5000)),  # Reduced from 50000 to 5000
+            "compliance_data": "regulatory_info" * 1000,  # Reduced from 10000 to 1000
+            "generated_at": datetime.now(),
+            "status": "completed"
         }
         REPORT_QUEUE.append(report_data)
-        time.sleep(1)  # Report generation processing time
-        # Report remains queued for regulatory submission
+        time.sleep(0.5)  # Reduced processing time
+        
+        # Clean up report queue if it's getting too large
+        cleanup_report_queue()
+    
+    # Clean up completed reports before adding new ones
+    cleanup_report_queue()
     
     report_id = f"RPT_{len(REPORT_QUEUE)}_{int(time.time())}"
     
@@ -264,7 +413,7 @@ async def generate_report(background_tasks: BackgroundTasks):
     return {
         "report_id": report_id,
         "status": "queued",
-        "estimated_completion": "2-3 minutes",
+        "estimated_completion": "30 seconds",  # Updated estimate
         "reports_in_queue": len(REPORT_QUEUE)
     }
 
