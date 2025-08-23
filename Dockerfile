@@ -17,7 +17,7 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy application code (for production builds)
 COPY main.py .
 
 # Create non-root user for security
@@ -31,5 +31,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/ || exit 1
 
-# Default command
-CMD ["python", "main.py"]
+# Default command with auto-reload for development
+# Use --reload for development with volume mounts
+# Use --host 0.0.0.0 to allow external connections
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
