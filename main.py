@@ -10,10 +10,12 @@ import time
 import tracemalloc
 import psutil
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 import sys
+from collections import deque
+import weakref
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
@@ -21,18 +23,28 @@ import uvicorn
 from pydantic import BaseModel
 from pympler import muppy, summary, tracker
 
-TRANSACTION_CACHE = []  
+# Memory management configuration
+MAX_CACHE_SIZE = 50
+MAX_SESSIONS = 100
+MAX_REPORTS = 20
+MAX_VALIDATION_CACHE = 100
+MAX_AUDIT_LOG = 1000
+MAX_ACTIVE_TRADERS = 500
+SESSION_TIMEOUT_MINUTES = 30
+
+# Use deque with maxlen for bounded collections
+TRANSACTION_CACHE = deque(maxlen=MAX_CACHE_SIZE)
 ACTIVE_SESSIONS = {} 
 API_METRICS = {"requests": 0, "processing": 0}  
-REPORT_QUEUE = [] 
+REPORT_QUEUE = deque(maxlen=MAX_REPORTS)
 USER_PROFILES = []   
 REPORT_PROCESSOR = ThreadPoolExecutor(max_workers=4)
 
 bank_state = {
     "total_deposits": 1000000,
     "portfolios": {"AAPL": 100, "GOOGL": 50, "MSFT": 75},
-    "active_traders": set(),
-    "audit_log": []
+    "active_traders": deque(maxlen=MAX_ACTIVE_TRADERS),
+    "audit_log": deque(maxlen=MAX_AUDIT_LOG)
 }
 
 # Performance monitoring
@@ -42,34 +54,109 @@ class AccountSession:
     def __init__(self, user_id: str):
         self.user_id = user_id
         self.preferences = {}
-        self.transaction_history = [i for i in range(10000)]  # Pre-load recent transactions
+        # Reduce transaction history size significantly
+        self.transaction_history = list(range(100))  # Reduced from 10000 to 100
         self.created_at = datetime.now()
+        self.last_accessed = datetime.now()
         self.primary_account = None
-        self.linked_accounts = []
+        self._linked_accounts = weakref.WeakSet()  # Use WeakSet to prevent circular refs
         
     def link_account(self, account):
         """Links related banking accounts for easier access"""
-        account.primary_account = self
-        self.linked_accounts.append(account)
+        account.primary_account = weakref.ref(self)  # Use weak reference
+        self._linked_accounts.add(account)
+    
+    def is_expired(self) -> bool:
+        """Check if session has expired"""
+        return datetime.now() - self.last_accessed > timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+    
+    def update_access_time(self):
+        """Update last accessed time"""
+        self.last_accessed = datetime.now()
+    
+    @property
+    def linked_accounts(self):
+        """Get linked accounts (alive weak references only)"""
+        return list(self._linked_accounts)
 
 class TransactionProcessor:
     def __init__(self):
         self.validation_cache = {}
         self.processors = []
+        self.cache_access_times = {}  # Track access times for LRU eviction
         
     def validate_transaction(self, transaction_data: str):
+        # Clean expired cache entries first
+        self._cleanup_expired_cache()
+        
         # Cache validation results for performance
         if transaction_data not in self.validation_cache:
+            # If cache is full, evict oldest entries
+            if len(self.validation_cache) >= MAX_VALIDATION_CACHE:
+                self._evict_oldest_entries()
+            
             self.validation_cache[transaction_data] = {
-                "validated_data": transaction_data * 1000,  # Expanded validation data
-                "compliance_checks": list(range(5000)),  # Regulatory compliance data
+                "validated_data": transaction_data * 100,  # Reduced from 1000 to 100
+                "compliance_checks": list(range(500)),  # Reduced from 5000 to 500
                 "timestamp": datetime.now()
             }
+        
+        # Update access time for LRU
+        self.cache_access_times[transaction_data] = datetime.now()
         return self.validation_cache[transaction_data]
+    
+    def _cleanup_expired_cache(self):
+        """Remove cache entries older than 1 hour"""
+        cutoff_time = datetime.now() - timedelta(hours=1)
+        expired_keys = [
+            key for key, data in self.validation_cache.items()
+            if data.get('timestamp', datetime.min) < cutoff_time
+        ]
+        for key in expired_keys:
+            self.validation_cache.pop(key, None)
+            self.cache_access_times.pop(key, None)
+    
+    def _evict_oldest_entries(self):
+        """Evict 25% of oldest entries when cache is full"""
+        if not self.cache_access_times:
+            return
+        
+        # Sort by access time and remove oldest 25%
+        sorted_keys = sorted(self.cache_access_times.keys(), 
+                           key=lambda k: self.cache_access_times[k])
+        keys_to_remove = sorted_keys[:len(sorted_keys) // 4]
+        
+        for key in keys_to_remove:
+            self.validation_cache.pop(key, None)
+            self.cache_access_times.pop(key, None)
 
 transaction_processor = TransactionProcessor()
 
-app = FastAPI(title="SecureBank API", version="2.1.3", description="Enterprise Banking Platform")
+# Session cleanup utilities
+def cleanup_expired_sessions():
+    """Remove expired sessions to prevent memory leaks"""
+    expired_sessions = [
+        user_id for user_id, session in ACTIVE_SESSIONS.items()
+        if session.is_expired()
+    ]
+    for user_id in expired_sessions:
+        ACTIVE_SESSIONS.pop(user_id, None)
+    return len(expired_sessions)
+
+def periodic_cleanup():
+    """Perform periodic cleanup of expired resources"""
+    # Clean expired sessions
+    expired_count = cleanup_expired_sessions()
+    
+    # Clean transaction processor cache
+    transaction_processor._cleanup_expired_cache()
+    
+    # Trigger garbage collection if needed
+    if expired_count > 0:
+        collected = gc.collect()
+        return {"expired_sessions": expired_count, "gc_collected": collected}
+    
+    return {"expired_sessions": expired_count, "gc_collected": 0}
 
 # Models
 class ProcessRequest(BaseModel):
@@ -84,20 +171,61 @@ class TransferRequest(BaseModel):
 # Start memory profiling
 tracemalloc.start()
 
-@app.on_event("startup")
-async def startup_event():
+@asyncio.create_task
+async def periodic_cleanup_task():
+    """Background task to periodically clean up expired resources"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Run every 5 minutes
+            cleanup_result = periodic_cleanup()
+            if cleanup_result["expired_sessions"] > 0:
+                print(f"Periodic cleanup: {cleanup_result}")
+        except Exception as e:
+            print(f"Error in periodic cleanup: {e}")
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     print("Initializing SecureBank API...")
-    # Initialize demo customer accounts with linked relationships
-    for i in range(10):
+    # Initialize demo customer accounts with linked relationships (reduced count)
+    for i in range(5):  # Reduced from 10 to 5
         primary = AccountSession(f"customer_{i}")
         savings = AccountSession(f"savings_{i}")
         primary.link_account(savings)
         USER_PROFILES.append(primary)
+    
+    # Start periodic cleanup task
+    cleanup_task = asyncio.create_task(periodic_cleanup_task())
+    
+    yield
+    
+    # Shutdown
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    print("SecureBank API shutdown complete")
+
+app = FastAPI(
+    title="SecureBank API", 
+    version="2.1.3", 
+    description="Enterprise Banking Platform",
+    lifespan=lifespan
+)
 
 @app.middleware("http")
 async def track_api_metrics(request, call_next):
     API_METRICS["requests"] += 1
     API_METRICS["processing"] += 1
+    
+    # Perform cleanup every 100 requests
+    if API_METRICS["requests"] % 100 == 0:
+        cleanup_result = periodic_cleanup()
+        if cleanup_result["expired_sessions"] > 0:
+            print(f"Middleware cleanup: {cleanup_result}")
     
     response = await call_next(request)
     
@@ -116,14 +244,17 @@ async def process_transaction(request: ProcessRequest):
     # Generate unique transaction ID with timestamp
     transaction_id = f"{request.data}_{time.time()}"
     
-    # Store transaction details for audit and compliance
-    TRANSACTION_CACHE.append({
+    # Store transaction details for audit and compliance (reduced memory footprint)
+    transaction_data = {
         "transaction_id": transaction_id,
-        "market_data": list(range(10000)),  # Real-time market indicators
-        "risk_metrics": "x" * 5000,  # Risk assessment data
+        "market_data": list(range(1000)),  # Reduced from 10000 to 1000
+        "risk_metrics": "x" * 500,  # Reduced from 5000 to 500
         "timestamp": datetime.now(),
         "client_request": request.dict()
-    })
+    }
+    
+    # Add to bounded cache (deque automatically evicts old entries)
+    TRANSACTION_CACHE.append(transaction_data)
     
     # Validate transaction through compliance system
     validation_result = transaction_processor.validate_transaction(request.data)
@@ -140,25 +271,41 @@ async def create_user_session(user_id: str):
     """
     Create persistent user session for account management
     """
+    # Clean expired sessions first
+    cleanup_expired_sessions()
+    
+    # Check if we're at session limit
+    if len(ACTIVE_SESSIONS) >= MAX_SESSIONS:
+        # Remove oldest sessions if at limit
+        oldest_sessions = sorted(
+            ACTIVE_SESSIONS.items(),
+            key=lambda x: x[1].last_accessed
+        )[:10]  # Remove oldest 10 sessions
+        
+        for old_user_id, _ in oldest_sessions:
+            ACTIVE_SESSIONS.pop(old_user_id, None)
+    
     # Check if user has existing session
     if user_id in ACTIVE_SESSIONS:
         session = ACTIVE_SESSIONS[user_id]
+        session.update_access_time()  # Update last accessed time
     else:
         # Create new account session
         session = AccountSession(user_id)
         ACTIVE_SESSIONS[user_id] = session
         
-        # Link with savings account for convenience
-        savings_session = AccountSession(f"{user_id}_savings")
-        session.link_account(savings_session)
+        # Link with savings account for convenience (if not at limit)
+        if len(ACTIVE_SESSIONS) < MAX_SESSIONS - 1:
+            savings_session = AccountSession(f"{user_id}_savings")
+            session.link_account(savings_session)
     
-    # Track user activity for personalization
+    # Track user activity for personalization (bounded)
     if 'activities' not in session.preferences:
-        session.preferences['activities'] = []
+        session.preferences['activities'] = deque(maxlen=50)  # Bounded activities
     
     session.preferences['activities'].append({
         "timestamp": datetime.now(),
-        "interaction_data": list(range(1000))  # User behavior analytics
+        "interaction_data": list(range(100))  # Reduced from 1000 to 100
     })
     
     return {
@@ -214,8 +361,8 @@ async def update_portfolio(item: str, quantity: int):
     """
     Update customer investment portfolio holdings
     """
-    # Track active trader for compliance
-    bank_state["active_traders"].add(f"trader_{time.time()}")
+    # Track active trader for compliance (bounded collection)
+    bank_state["active_traders"].append(f"trader_{time.time()}")
     
     # Initialize portfolio position if new
     if item not in bank_state["portfolios"]:
@@ -245,13 +392,14 @@ async def generate_report(background_tasks: BackgroundTasks):
     Generate comprehensive financial reports for compliance
     """
     def generate_regulatory_report(report_id: str):
-        # Compile comprehensive regulatory data
+        # Compile comprehensive regulatory data (reduced memory footprint)
         report_data = {
             "report_id": report_id,
-            "transaction_analysis": list(range(50000)),  # Detailed transaction metrics
-            "compliance_data": "regulatory_info" * 10000,  # Compliance requirements
+            "transaction_analysis": list(range(5000)),  # Reduced from 50000 to 5000
+            "compliance_data": "regulatory_info" * 1000,  # Reduced from 10000 to 1000
             "generated_at": datetime.now()
         }
+        # Add to bounded queue (automatically evicts old reports)
         REPORT_QUEUE.append(report_data)
         time.sleep(1)  # Report generation processing time
         # Report remains queued for regulatory submission
